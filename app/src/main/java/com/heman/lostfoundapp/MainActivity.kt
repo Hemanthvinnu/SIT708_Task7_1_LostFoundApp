@@ -1,16 +1,22 @@
 package com.heman.lostfoundapp
 
+import android.Manifest
 import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.location.Geocoder
+import android.location.Location
 import android.net.Uri
 import android.os.Bundle
 import android.provider.BaseColumns
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -21,10 +27,24 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.maps.CameraUpdateFactory
+import com.google.android.gms.maps.GoogleMap
+import com.google.android.gms.maps.OnMapReadyCallback
+import com.google.android.gms.maps.SupportMapFragment
+import com.google.android.gms.maps.model.LatLng
+import com.google.android.gms.maps.model.MarkerOptions
+import com.google.android.libraries.places.api.Places
+import com.google.android.libraries.places.api.model.Place
+import com.google.android.libraries.places.widget.Autocomplete
+import com.google.android.libraries.places.widget.model.AutocompleteActivityMode
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -40,12 +60,14 @@ data class Advert(
     val ownerName: String,
     val phone: String,
     val location: String,
+    val latitude: Double,
+    val longitude: Double,
     val imageUri: String,
     val createdAt: String
 )
 
 class LostFoundDatabase(context: Context) :
-    SQLiteOpenHelper(context, "lost_found.db", null, 1) {
+    SQLiteOpenHelper(context, "lost_found.db", null, 2) {
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
@@ -59,6 +81,8 @@ class LostFoundDatabase(context: Context) :
                 owner_name TEXT NOT NULL,
                 phone TEXT NOT NULL,
                 location TEXT NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
                 image_uri TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
@@ -80,6 +104,8 @@ class LostFoundDatabase(context: Context) :
             put("owner_name", advert.ownerName)
             put("phone", advert.phone)
             put("location", advert.location)
+            put("latitude", advert.latitude)
+            put("longitude", advert.longitude)
             put("image_uri", advert.imageUri)
             put("created_at", advert.createdAt)
         }
@@ -111,6 +137,8 @@ class LostFoundDatabase(context: Context) :
                         ownerName = it.getString(it.getColumnIndexOrThrow("owner_name")),
                         phone = it.getString(it.getColumnIndexOrThrow("phone")),
                         location = it.getString(it.getColumnIndexOrThrow("location")),
+                        latitude = it.getDouble(it.getColumnIndexOrThrow("latitude")),
+                        longitude = it.getDouble(it.getColumnIndexOrThrow("longitude")),
                         imageUri = it.getString(it.getColumnIndexOrThrow("image_uri")),
                         createdAt = it.getString(it.getColumnIndexOrThrow("created_at"))
                     )
@@ -125,15 +153,23 @@ class LostFoundDatabase(context: Context) :
     }
 }
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), OnMapReadyCallback {
 
     private lateinit var database: LostFoundDatabase
     private lateinit var recyclerView: RecyclerView
     private lateinit var emptyText: TextView
     private lateinit var adapter: AdvertAdapter
+    private lateinit var radiusInput: EditText
+    private lateinit var locationClient: FusedLocationProviderClient
     private var selectedFilter = "All"
     private var pendingImageUri: String = ""
     private var pendingPreview: ImageView? = null
+    private var pendingLocationInput: EditText? = null
+    private var selectedLatitude: Double? = null
+    private var selectedLongitude: Double? = null
+    private var currentLatitude: Double? = null
+    private var currentLongitude: Double? = null
+    private var googleMap: GoogleMap? = null
 
     private val imagePicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -146,11 +182,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val placePicker: ActivityResultLauncher<Intent> =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK && result.data != null) {
+                val place = Autocomplete.getPlaceFromIntent(result.data!!)
+                val latLng = place.latLng
+                if (latLng != null) {
+                    selectedLatitude = latLng.latitude
+                    selectedLongitude = latLng.longitude
+                    pendingLocationInput?.setText(place.address ?: place.name ?: "Selected location")
+                }
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         database = LostFoundDatabase(this)
+        locationClient = LocationServices.getFusedLocationProviderClient(this)
+
+        val apiKey = getString(R.string.google_maps_key)
+        if (!Places.isInitialized() && !apiKey.startsWith("PUT_")) {
+            Places.initialize(applicationContext, apiKey)
+        }
+
         buildMainScreen()
         loadAdverts()
+        askForLocationPermission()
     }
 
     private fun buildMainScreen() {
@@ -202,9 +259,42 @@ class MainActivity : AppCompatActivity() {
             text = "Post"
             setOnClickListener { showPostDialog() }
         }
+        val showMapButton = Button(this).apply {
+            text = "Show on Map"
+            setOnClickListener { showAdvertsOnMap() }
+        }
         controls.addView(filterSpinner)
         controls.addView(addButton)
+        controls.addView(showMapButton)
         root.addView(controls)
+
+        radiusInput = input("Radius in km, example 5. Leave blank to show all.").apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+        }
+        root.addView(radiusInput)
+
+        val currentLocationButton = Button(this).apply {
+            text = "GET CURRENT LOCATION"
+            setOnClickListener { getCurrentLocation(null) }
+        }
+        root.addView(currentLocationButton)
+
+        val mapContainerId = View.generateViewId()
+        val mapContainer = FrameLayout(this).apply {
+            id = mapContainerId
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                650
+            ).apply { setMargins(0, 14, 0, 14) }
+        }
+        root.addView(mapContainer)
+
+        val mapFragment = SupportMapFragment.newInstance()
+        supportFragmentManager.beginTransaction()
+            .replace(mapContainerId, mapFragment)
+            .commit()
+        mapFragment.getMapAsync(this)
 
         emptyText = TextView(this).apply {
             text = "No adverts yet. Tap Post to add your first lost or found item."
@@ -235,6 +325,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun showPostDialog() {
         pendingImageUri = ""
+        selectedLatitude = null
+        selectedLongitude = null
 
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -247,7 +339,7 @@ class MainActivity : AppCompatActivity() {
         val descriptionInput = input("Description")
         val nameInput = input("Your name")
         val phoneInput = input("Phone number")
-        val locationInput = input("Location, e.g. Deakin library")
+        val locationInput = input("Type location, e.g. Deakin library")
 
         pendingPreview = ImageView(this).apply {
             setBackgroundColor(0xFFE4ECEB.toInt())
@@ -263,6 +355,30 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { imagePicker.launch(arrayOf("image/*")) }
         }
 
+        val searchLocationButton = Button(this).apply {
+            text = "SEARCH TYPED LOCATION"
+            setOnClickListener {
+                pendingLocationInput = locationInput
+                searchTypedLocation(locationInput)
+            }
+        }
+
+        val autocompleteButton = Button(this).apply {
+            text = "CHOOSE LOCATION FROM GOOGLE"
+            setOnClickListener {
+                pendingLocationInput = locationInput
+                openPlaceSearch()
+            }
+        }
+
+        val useCurrentLocationButton = Button(this).apply {
+            text = "GET CURRENT LOCATION"
+            setOnClickListener {
+                pendingLocationInput = locationInput
+                getCurrentLocation(locationInput)
+            }
+        }
+
         form.addView(label("Type"))
         form.addView(typeSpinner)
         form.addView(label("Category"))
@@ -272,6 +388,9 @@ class MainActivity : AppCompatActivity() {
         form.addView(nameInput)
         form.addView(phoneInput)
         form.addView(locationInput)
+        form.addView(searchLocationButton)
+        form.addView(autocompleteButton)
+        form.addView(useCurrentLocationButton)
         form.addView(pendingPreview)
         form.addView(imageButton)
 
@@ -325,6 +444,11 @@ class MainActivity : AppCompatActivity() {
             return false
         }
 
+        if (selectedLatitude == null || selectedLongitude == null) {
+            toast("Please choose a location or use current location.")
+            return false
+        }
+
         val now = SimpleDateFormat("dd MMM yyyy, h:mm a", Locale.getDefault()).format(Date())
         database.insertAdvert(
             Advert(
@@ -336,6 +460,8 @@ class MainActivity : AppCompatActivity() {
                 ownerName = ownerName.trim(),
                 phone = phone.trim(),
                 location = location.trim(),
+                latitude = selectedLatitude!!,
+                longitude = selectedLongitude!!,
                 imageUri = pendingImageUri,
                 createdAt = now
             )
@@ -386,6 +512,166 @@ class MainActivity : AppCompatActivity() {
         database.deleteAdvert(advert.id)
         toast("Advert removed")
         loadAdverts()
+        showAdvertsOnMap()
+    }
+
+    private fun openPlaceSearch() {
+        if (getString(R.string.google_maps_key).startsWith("PUT_")) {
+            toast("Add your Google Maps API key in strings.xml first.")
+            return
+        }
+
+        val fields = listOf(Place.Field.ID, Place.Field.NAME, Place.Field.ADDRESS, Place.Field.LAT_LNG)
+        val intent = Autocomplete.IntentBuilder(AutocompleteActivityMode.OVERLAY, fields).build(this)
+        placePicker.launch(intent)
+    }
+
+    private fun searchTypedLocation(locationInput: EditText) {
+        val locationText = locationInput.text.toString().trim()
+        if (locationText.isBlank()) {
+            toast("Please type a location first.")
+            return
+        }
+
+        try {
+            val geocoder = Geocoder(this, Locale.getDefault())
+            val results = geocoder.getFromLocationName(locationText, 1)
+            val firstResult = results?.firstOrNull()
+
+            if (firstResult == null) {
+                useSimpleLocationFallback(locationText, locationInput)
+                return
+            }
+
+            selectedLatitude = firstResult.latitude
+            selectedLongitude = firstResult.longitude
+            locationInput.setText(locationText)
+            moveMap(firstResult.latitude, firstResult.longitude, locationText)
+            toast("Location selected")
+        } catch (error: Exception) {
+            useSimpleLocationFallback(locationText, locationInput)
+        }
+    }
+
+    private fun useSimpleLocationFallback(locationText: String, locationInput: EditText) {
+        val lowerText = locationText.lowercase(Locale.getDefault())
+        val point = when {
+            lowerText.contains("deakin") || lowerText.contains("burwood") ->
+                LatLng(-37.8476, 145.1149)
+            lowerText.contains("flinders") ->
+                LatLng(-37.8183, 144.9671)
+            lowerText.contains("melbourne central") ->
+                LatLng(-37.8100, 144.9626)
+            lowerText.contains("southern cross") ->
+                LatLng(-37.8184, 144.9525)
+            lowerText.contains("waterfront") || lowerText.contains("geelong") ->
+                LatLng(-38.1436, 144.3619)
+            else -> null
+        }
+
+        if (point == null) {
+            toast("Try: Deakin Burwood Library, Flinders Street, or Melbourne Central.")
+            return
+        }
+
+        selectedLatitude = point.latitude
+        selectedLongitude = point.longitude
+        locationInput.setText(locationText)
+        moveMap(point.latitude, point.longitude, locationText)
+        toast("Location selected using simple search")
+    }
+
+    private fun askForLocationPermission() {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+                101
+            )
+        }
+    }
+
+    private fun getCurrentLocation(locationInput: EditText?) {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            askForLocationPermission()
+            return
+        }
+
+        locationClient.lastLocation.addOnSuccessListener { location ->
+            if (location == null) {
+                toast("Location not ready. Please try again.")
+                return@addOnSuccessListener
+            }
+
+            currentLatitude = location.latitude
+            currentLongitude = location.longitude
+            selectedLatitude = location.latitude
+            selectedLongitude = location.longitude
+
+            val locationText = "Current location: ${location.latitude}, ${location.longitude}"
+            locationInput?.setText(locationText)
+            moveMap(location.latitude, location.longitude, "My current location")
+            toast("Current location selected")
+        }
+    }
+
+    private fun showAdvertsOnMap() {
+        val map = googleMap ?: return
+        map.clear()
+
+        val adverts = database.getAdverts(selectedFilter)
+        val radiusKm = radiusInput.text.toString().toDoubleOrNull()
+        var shownCount = 0
+
+        for (advert in adverts) {
+            if (radiusKm != null && currentLatitude != null && currentLongitude != null) {
+                val result = FloatArray(1)
+                Location.distanceBetween(
+                    currentLatitude!!,
+                    currentLongitude!!,
+                    advert.latitude,
+                    advert.longitude,
+                    result
+                )
+                val distanceKm = result[0] / 1000.0
+                if (distanceKm > radiusKm) {
+                    continue
+                }
+            }
+
+            val point = LatLng(advert.latitude, advert.longitude)
+            map.addMarker(
+                MarkerOptions()
+                    .position(point)
+                    .title("${advert.type}: ${advert.title}")
+                    .snippet("${advert.category} - ${advert.phone}")
+            )
+            map.moveCamera(CameraUpdateFactory.newLatLngZoom(point, 12f))
+            shownCount++
+        }
+
+        if (radiusKm != null && currentLatitude == null) {
+            toast("Tap GET CURRENT LOCATION first for radius search.")
+        } else {
+            toast("Showing $shownCount advert(s) on the map.")
+        }
+    }
+
+    private fun moveMap(latitude: Double, longitude: Double, title: String) {
+        val map = googleMap ?: return
+        val point = LatLng(latitude, longitude)
+        map.addMarker(MarkerOptions().position(point).title(title))
+        map.moveCamera(CameraUpdateFactory.newLatLngZoom(point, 14f))
+    }
+
+    override fun onMapReady(map: GoogleMap) {
+        googleMap = map
+        val deakinBurwood = LatLng(-37.8476, 145.1149)
+        map.moveCamera(CameraUpdateFactory.newLatLngZoom(deakinBurwood, 11f))
     }
 
     private fun spinnerOf(values: List<String>): Spinner {
